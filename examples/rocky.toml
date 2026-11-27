@@ -1,0 +1,19 @@
+schema_version = 1
+admin_socket = "../.rocky/admin.sock"
+state_dir = "../.rocky/state"
+
+[[listeners]]
+name = "local"
+bind = "127.0.0.1:8080"
+protocols = ["http1"]
+default_site = "localhost"
+
+[[sites]]
+host = "localhost"
+listeners = ["local"]
+
+[[sites.routes]]
+name = "files"
+path_prefix = "/"
+static_root = "www"
+index = "index.txt"

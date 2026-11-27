@@ -1,0 +1,51 @@
+[package]
+name = "rocky"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+
+[dependencies]
+anyhow = "1"
+arc-swap = "1"
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+futures-util = "0.3"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+httpdate = "1"
+humantime = "2"
+hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "ring", "tls12"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "tokio"] }
+instant-acme = { version = "0.8", default-features = false, features = ["hyper-rustls", "rcgen", "ring"] }
+ipnet = "2"
+mime_guess = "2"
+percent-encoding = "2"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "bloom"] }
+rand = "0.9"
+rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
+rustix = { version = "1", features = ["fs", "process"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+rustls-native-certs = "0.8"
+rustls-pemfile = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_path_to_error = "0.1"
+sha2 = "0.10"
+socket2 = "0.6"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+tokio-util = { version = "0.7", features = ["io", "rt"] }
+toml = "0.8"
+tower-service = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+x509-parser = "0.18"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["test-util"] }
