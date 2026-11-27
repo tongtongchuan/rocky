@@ -35,24 +35,34 @@ pub fn full(data: impl Into<Bytes>) -> Body {
 }
 
 pub fn constrain(body: Body, idle: Duration, limit: Option<(u64, Arc<AtomicBool>)>) -> Body {
-    boxed(Constrained {
-        body,
-        idle,
-        timer: None,
-        limit,
-        done: false,
-    })
+    boxed(Constrained::new(body, idle, limit))
 }
 
-struct Constrained {
-    body: Body,
+pub struct Constrained<B> {
+    body: B,
     idle: Duration,
     timer: Option<Pin<Box<Sleep>>>,
     limit: Option<(u64, Arc<AtomicBool>)>,
     done: bool,
 }
 
-impl HttpBody for Constrained {
+impl<B> Constrained<B> {
+    pub fn new(body: B, idle: Duration, limit: Option<(u64, Arc<AtomicBool>)>) -> Self {
+        Self {
+            body,
+            idle,
+            timer: None,
+            limit,
+            done: false,
+        }
+    }
+}
+
+impl<B> HttpBody for Constrained<B>
+where
+    B: HttpBody<Data = Bytes> + Unpin,
+    B::Error: Into<BodyError>,
+{
     type Data = Bytes;
     type Error = BodyError;
 
@@ -82,7 +92,7 @@ impl HttpBody for Constrained {
                     *remaining = after;
                 }
                 self.done = !matches!(frame, Some(Ok(_)));
-                Poll::Ready(frame)
+                Poll::Ready(frame.map(|frame| frame.map_err(Into::into)))
             }
             Poll::Pending => {
                 let idle = self.idle;

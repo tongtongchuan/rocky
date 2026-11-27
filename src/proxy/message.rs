@@ -20,6 +20,7 @@ use http::{
     uri::PathAndQuery,
 };
 use http_body::{Body as HttpBody, Frame, SizeHint};
+use hyper::body::Incoming;
 use tokio_util::sync::{CancellationToken, DropGuard, WaitForCancellationFutureOwned};
 
 use super::{
@@ -27,7 +28,7 @@ use super::{
     transport::{Http2Connection, UpstreamResponse},
 };
 use crate::{
-    body::{self, Body, BodyError},
+    body::{self, Body, BodyError, Constrained},
     config::UpstreamProtocol,
 };
 
@@ -55,7 +56,7 @@ pub(super) struct RequestDraft {
     method: Method,
     target: PathAndQuery,
     headers: HeaderMap,
-    trailers: Arc<TrailerPolicy>,
+    trailers: Option<TrailerPolicy>,
     downstream_protocol: Version,
     upstream_protocol: UpstreamProtocol,
     accept_response_trailers: bool,
@@ -102,7 +103,7 @@ impl RequestDraft {
                 .cloned()
                 .unwrap_or_else(|| PathAndQuery::from_static("/")),
             headers: request.headers,
-            trailers: Arc::new(request_trailers),
+            trailers: Some(request_trailers),
             downstream_protocol: meta.version,
             upstream_protocol: protocol,
             accept_response_trailers,
@@ -110,17 +111,25 @@ impl RequestDraft {
     }
 
     pub(super) fn build(
-        &self,
+        &mut self,
         origin: &Uri,
         mut body: Body,
         lease: &Arc<Lease>,
-        cancel: CancellationToken,
-    ) -> Request<Body> {
-        let mut headers = self.headers.clone();
+        preserve_headers: bool,
+    ) -> (Request<Body>, Option<DropGuard>) {
+        let trailers = lease
+            .upload
+            .is_some()
+            .then(|| self.trailers.take().expect("upload is built once"));
+        let mut headers = if preserve_headers {
+            self.headers.clone()
+        } else {
+            std::mem::take(&mut self.headers)
+        };
         if self.upstream_protocol == UpstreamProtocol::H1 {
             insert_origin_host(&mut headers, origin);
-            if !body.is_end_stream()
-                && (self.trailers.declared_for_h1()
+            if let Some(trailers) = &trailers
+                && (trailers.declared_for_h1()
                     || (body.size_hint().exact().is_none()
                         && !headers.contains_key(CONTENT_LENGTH)))
             {
@@ -128,28 +137,32 @@ impl RequestDraft {
                 headers.insert(TRANSFER_ENCODING, HeaderValue::from_static("chunked"));
             }
         }
-        if !body.is_end_stream() {
-            lease.begin_upload();
+        let cancel_upload = if let Some(trailers) = trailers {
+            let cancel = CancellationToken::new();
+            let guard = cancel.clone().drop_guard();
             body = body::boxed(UploadBody {
                 inner: Some(body),
                 lease: Arc::clone(lease),
                 cancelled: Box::pin(cancel.cancelled_owned()),
-                trailers: Arc::clone(&self.trailers),
+                trailers,
             });
-        }
+            Some(guard)
+        } else {
+            None
+        };
         let mut request = Request::new(body);
         *request.method_mut() = self.method.clone();
         *request.uri_mut() = origin_uri(origin, self.target.clone());
         *request.version_mut() = self.upstream_protocol.version();
         *request.headers_mut() = headers;
-        request
+        (request, cancel_upload)
     }
 
     pub(super) fn response(
         &self,
         upstream: UpstreamResponse,
         lease: Arc<Lease>,
-        cancel_upload: DropGuard,
+        cancel_upload: Option<DropGuard>,
         idle_timeout: Duration,
     ) -> Response<Body> {
         let (mut parts, incoming) = upstream.response.into_parts();
@@ -167,7 +180,9 @@ impl RequestDraft {
 
         let body = if incoming.is_end_stream() {
             lease.complete_response();
-            cancel_upload.disarm();
+            if let Some(guard) = cancel_upload {
+                guard.disarm();
+            }
             body::empty()
         } else {
             if trailers.declared_for_h1() && self.method != Method::HEAD {
@@ -176,15 +191,17 @@ impl RequestDraft {
                     .headers
                     .insert(TRANSFER_ENCODING, HeaderValue::from_static("chunked"));
             }
-            let upload_rejected = Box::pin(lease.upload_rejected.clone().cancelled_owned());
-            body::boxed(DownloadBody {
-                inner: Some(body::constrain(body::boxed(incoming), idle_timeout, None)),
-                lease: Some(lease),
-                cancel_upload: Some(cancel_upload),
-                trailers,
-                upload_rejected,
-                upstream_connection: upstream.connection,
+            let upload = cancel_upload.map(|cancel| DownloadUpload {
+                cancel,
+                rejected: Box::pin(lease.upload().rejected.clone().cancelled_owned()),
+                connection: upstream.connection,
                 idle_timeout,
+            });
+            body::boxed(DownloadBody {
+                inner: Some(Constrained::new(incoming, idle_timeout, None)),
+                lease: Some(lease),
+                trailers,
+                upload,
             })
         };
         Response::from_parts(parts, body)
@@ -419,12 +436,12 @@ struct UploadBody {
     inner: Option<Body>,
     lease: Arc<Lease>,
     cancelled: Pin<Box<WaitForCancellationFutureOwned>>,
-    trailers: Arc<TrailerPolicy>,
+    trailers: TrailerPolicy,
 }
 
 impl Drop for UploadBody {
     fn drop(&mut self) {
-        self.lease.complete_upload();
+        self.lease.upload().complete();
     }
 }
 
@@ -448,7 +465,7 @@ impl HttpBody for UploadBody {
         while let Some(inner) = &mut this.inner {
             let result = std::task::ready!(Pin::new(&mut *inner).poll_frame(cx));
             if matches!(&result, Some(Err(_))) {
-                this.lease.reject_upload();
+                this.lease.upload().rejected.cancel();
             }
             if !matches!(&result, Some(Ok(_))) || inner.is_end_stream() {
                 this.inner = None;
@@ -478,12 +495,16 @@ impl HttpBody for UploadBody {
 }
 
 struct DownloadBody {
-    inner: Option<Body>,
+    inner: Option<Constrained<Incoming>>,
     lease: Option<Arc<Lease>>,
-    cancel_upload: Option<DropGuard>,
     trailers: TrailerPolicy,
-    upload_rejected: Pin<Box<WaitForCancellationFutureOwned>>,
-    upstream_connection: Option<Http2Connection>,
+    upload: Option<DownloadUpload>,
+}
+
+struct DownloadUpload {
+    cancel: DropGuard,
+    rejected: Pin<Box<WaitForCancellationFutureOwned>>,
+    connection: Option<Http2Connection>,
     idle_timeout: Duration,
 }
 
@@ -491,20 +512,19 @@ impl DownloadBody {
     fn complete(&mut self) {
         self.inner = None;
         self.lease.take().unwrap().complete_response();
-        self.cancel_upload.take().unwrap().disarm();
+        if let Some(upload) = self.upload.take() {
+            upload.cancel.disarm();
+        }
     }
 
     fn abort_upload(&mut self) {
-        if let Some(guard) = self.cancel_upload.take() {
-            drop(guard);
-            let lease = self.lease.as_ref().unwrap();
-            if lease
-                .upload_pending
-                .load(std::sync::atomic::Ordering::Relaxed)
-                && let Some(connection) = self.upstream_connection.take()
+        if let Some(upload) = self.upload.take() {
+            drop(upload.cancel);
+            let state = self.lease.as_ref().unwrap().upload();
+            if state.is_pending()
+                && let Some(connection) = upload.connection
             {
-                connection
-                    .retire_if_upload_stalls(lease.upload_finished.clone(), self.idle_timeout);
+                connection.retire_if_upload_stalls(state.finished.clone(), upload.idle_timeout);
             }
         }
     }
@@ -536,7 +556,9 @@ impl HttpBody for DownloadBody {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
         let this = &mut *self;
-        if this.inner.is_some() && this.upload_rejected.as_mut().poll(cx).is_ready() {
+        if let Some(upload) = &mut this.upload
+            && upload.rejected.as_mut().poll(cx).is_ready()
+        {
             return this.fail("request_body", io::Error::other("downstream upload failed"));
         }
         while let Some(inner) = &mut this.inner {

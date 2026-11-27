@@ -254,43 +254,53 @@ impl ProxyPool {
         if !supports_transfer_encoding(request.headers(), request.version()) {
             return Err(ProxyError::UnsupportedTransferEncoding);
         }
-        let may_retry = matches!(*request.method(), Method::GET | Method::HEAD)
-            && request.body().is_end_stream();
+        let has_upload = !request.body().is_end_stream();
+        let may_retry = matches!(*request.method(), Method::GET | Method::HEAD) && !has_upload;
         let deadline = Instant::now()
             .checked_add(self.head_budget)
             .ok_or(ProxyError::Timeout)?;
         let (parts, body) = request.into_parts();
-        let draft = RequestDraft::new(parts, meta, self.config.protocol)?;
-        let mut upload = Some(body);
+        let mut draft = RequestDraft::new(parts, meta, self.config.protocol)?;
+        let mut body = Some(body);
         let mut previous_attempt = None;
 
         loop {
             if Instant::now() >= deadline {
                 return Err(ProxyError::Timeout);
             }
-            let Some((index, lease)) =
+            let Some((index, mut lease)) =
                 self.select(previous_attempt.as_ref().map(|(index, _)| *index))
             else {
                 return Err(previous_attempt.map_or(ProxyError::Unavailable, |(_, error)| error));
             };
             let endpoint = &self.endpoints[index];
-            let cancellation = CancellationToken::new();
-            let cancel_upload = cancellation.clone().drop_guard();
-            let outbound = draft.build(
+            lease.upload = has_upload.then(Upload::new);
+            let lease = Arc::new(lease);
+            let preserve_headers =
+                may_retry && self.endpoints.len() > 1 && previous_attempt.is_none();
+            let (outbound, cancel_upload) = draft.build(
                 &endpoint.config.url,
-                upload.take().unwrap_or_else(body::empty),
+                body.take().unwrap_or_else(body::empty),
                 &lease,
-                cancellation,
+                preserve_headers,
             );
-            let result = tokio::select! {
-                biased;
-                _ = lease.upload_rejected.cancelled() => return Err(ProxyError::Exchange),
-                result = endpoint.transport.request(outbound, deadline, self.config.response_head_timeout) => result,
+            let exchange =
+                endpoint
+                    .transport
+                    .request(outbound, deadline, self.config.response_head_timeout);
+            let result = if let Some(upload) = &lease.upload {
+                let result = tokio::select! {
+                    biased;
+                    _ = upload.rejected.cancelled() => return Err(ProxyError::Exchange),
+                    result = exchange => result,
+                };
+                if upload.rejected.is_cancelled() {
+                    return Err(ProxyError::Exchange);
+                }
+                result
+            } else {
+                exchange.await
             };
-
-            if lease.upload_rejected.is_cancelled() {
-                return Err(ProxyError::Exchange);
-            }
 
             match result {
                 Ok(response) => {
@@ -303,7 +313,7 @@ impl ProxyPool {
                 }
                 Err(error) => {
                     if !matches!(error, AttemptError::HeadTimeout)
-                        || !lease.upload_pending.load(Ordering::Relaxed)
+                        || !lease.upload.as_ref().is_some_and(Upload::is_pending)
                     {
                         lease.fail(error.label());
                     }
@@ -321,7 +331,7 @@ impl ProxyPool {
         }
     }
 
-    fn select(&self, exclude: Option<usize>) -> Option<(usize, Arc<Lease>)> {
+    fn select(&self, exclude: Option<usize>) -> Option<(usize, Lease)> {
         let mut weights = self.weights.lock().unwrap();
         let mut eligible = Vec::new();
         let mut total = 0;
@@ -345,7 +355,7 @@ impl ProxyPool {
             let endpoint = &self.endpoints[index];
             if let Some(lease) = endpoint.reserve(now, checks, self.config.cooldown) {
                 weights[index] = weights[index].saturating_sub(total);
-                return Some((index, Arc::new(lease)));
+                return Some((index, lease));
             }
             // Health and capacity can change between scoring and reserving an endpoint.
             eligible.swap_remove(position);
@@ -481,9 +491,7 @@ impl PoolEndpoint {
             cooldown,
             trial,
             response_complete: AtomicBool::new(false),
-            upload_pending: AtomicBool::new(false),
-            upload_finished: CancellationToken::new(),
-            upload_rejected: CancellationToken::new(),
+            upload: None,
             failure_recorded: AtomicBool::new(false),
         })
     }
@@ -556,24 +564,44 @@ struct Lease {
     cooldown: Duration,
     trial: Option<u64>,
     response_complete: AtomicBool,
-    upload_pending: AtomicBool,
-    upload_finished: CancellationToken,
-    upload_rejected: CancellationToken,
+    upload: Option<Upload>,
     failure_recorded: AtomicBool,
 }
 
+struct Upload {
+    pending: AtomicBool,
+    finished: CancellationToken,
+    rejected: CancellationToken,
+}
+
+impl Upload {
+    fn new() -> Self {
+        Self {
+            pending: AtomicBool::new(true),
+            finished: CancellationToken::new(),
+            rejected: CancellationToken::new(),
+        }
+    }
+
+    fn is_pending(&self) -> bool {
+        self.pending.load(Ordering::Relaxed)
+    }
+
+    fn complete(&self) {
+        self.pending.store(false, Ordering::Relaxed);
+        self.finished.cancel();
+    }
+}
+
 impl Lease {
-    fn begin_upload(&self) {
-        self.upload_pending.store(true, Ordering::Relaxed);
+    fn upload(&self) -> &Upload {
+        self.upload.as_ref().expect("upload state was initialized")
     }
 
-    fn complete_upload(&self) {
-        self.upload_pending.store(false, Ordering::Relaxed);
-        self.upload_finished.cancel();
-    }
-
-    fn reject_upload(&self) {
-        self.upload_rejected.cancel();
+    fn upload_rejected(&self) -> bool {
+        self.upload
+            .as_ref()
+            .is_some_and(|upload| upload.rejected.is_cancelled())
     }
 
     fn complete_response(&self) {
@@ -581,9 +609,7 @@ impl Lease {
     }
 
     fn fail(&self, label: &'static str) {
-        if self.upload_rejected.is_cancelled()
-            || self.failure_recorded.swap(true, Ordering::Relaxed)
-        {
+        if self.upload_rejected() || self.failure_recorded.swap(true, Ordering::Relaxed) {
             return;
         }
         let mut health = self.health.lock().unwrap();
@@ -600,7 +626,7 @@ impl Drop for Lease {
         if health.revision != trial {
             return;
         }
-        if self.response_complete.load(Ordering::Relaxed) && !self.upload_rejected.is_cancelled() {
+        if self.response_complete.load(Ordering::Relaxed) && !self.upload_rejected() {
             health.change(Phase::Healthy, None);
         } else {
             let last_failure = health.last_failure;

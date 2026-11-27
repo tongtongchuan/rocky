@@ -10,6 +10,7 @@ use std::{
 use ::http::{
     HeaderMap, HeaderValue, Method, Request, Response, StatusCode, Version, header, uri::Authority,
 };
+use http_body::Body as _;
 use ipnet::IpNet;
 use tokio::time::Instant;
 
@@ -251,12 +252,17 @@ impl Runtime {
                     scheme,
                     version: request.version(),
                 };
-                let exceeded = Arc::new(AtomicBool::new(false));
-                let request = request.map(|body| {
-                    body::constrain(body, idle, Some((max_body, Arc::clone(&exceeded))))
-                });
+                let (request, exceeded) = if request.body().is_end_stream() {
+                    (request, None)
+                } else {
+                    let exceeded = Arc::new(AtomicBool::new(false));
+                    let request = request.map(|body| {
+                        body::constrain(body, idle, Some((max_body, Arc::clone(&exceeded))))
+                    });
+                    (request, Some(exceeded))
+                };
                 match pool.exchange(request, &meta).await {
-                    _ if exceeded.load(Ordering::Acquire) => {
+                    _ if exceeded.is_some_and(|flag| flag.load(Ordering::Acquire)) => {
                         record.reject(StatusCode::PAYLOAD_TOO_LARGE, "body_limit")
                     }
                     Ok(response) => response,

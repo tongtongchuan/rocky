@@ -406,7 +406,9 @@ async fn retries_only_bodyless_get_or_head_on_connection_failure() {
     let hits = Arc::new(AtomicUsize::new(0));
     let origin = Origin::start(UpstreamProtocol::H1, None, {
         let hits = Arc::clone(&hits);
-        move |_| {
+        move |request| {
+            assert_eq!(request.headers()["x-request-id"], "retry");
+            assert_eq!(request.headers()["x-forwarded-host"], "public.test:8443");
             hits.fetch_add(1, Ordering::Relaxed);
             async { Response::new(body::empty()) }
         }
@@ -443,8 +445,12 @@ async fn retries_only_bodyless_get_or_head_on_connection_failure() {
         assert_eq!(hits.load(Ordering::Relaxed), 0);
     }
     let pool = ProxyPool::prepare(&config, &LIMITS, None).unwrap();
+    let request = Request::builder()
+        .header("x-request-id", "retry")
+        .body(body::empty())
+        .unwrap();
     assert_eq!(
-        response_status(get(&pool, Version::HTTP_11).await),
+        response_status(pool.exchange(request, &metadata(Version::HTTP_11)).await),
         StatusCode::OK
     );
     assert_eq!(hits.load(Ordering::Relaxed), 1);
