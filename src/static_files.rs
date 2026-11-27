@@ -30,15 +30,16 @@ use http_body::Frame;
 use http_body_util::StreamBody;
 use rustix::fs::{Mode, OFlags, ResolveFlags, open, openat2};
 use sha2::{Digest, Sha256};
-use tokio::{sync::Semaphore, task::spawn_blocking};
+use tokio::{sync::Semaphore, task::spawn_blocking, time::timeout};
 
 use crate::body::{self, Body};
 
 const CONTAINMENT: ResolveFlags = ResolveFlags::BENEATH.union(ResolveFlags::NO_SYMLINKS);
+const MAX_BUFFERED_FILE_BYTES: usize = 64 * 1024;
 
 pub struct DocumentRoot {
-    root: Arc<OwnedFd>,
-    index: Option<Arc<str>>,
+    root: OwnedFd,
+    index: Option<String>,
     file_work: Arc<Semaphore>,
     max_buffer_bytes: usize,
 }
@@ -57,14 +58,19 @@ impl DocumentRoot {
         openat2(&root, ".", flags, Mode::empty(), CONTAINMENT)
             .context("checking openat2 support for document root")?;
         Ok(Self {
-            root: Arc::new(root),
-            index: index.map(Arc::from),
+            root,
+            index: index.map(str::to_owned),
             file_work,
             max_buffer_bytes,
         })
     }
 
-    pub async fn serve(&self, request: Parts, relative_path: &str) -> Response<Body> {
+    pub async fn serve(
+        self: &Arc<Self>,
+        request: Parts,
+        relative_path: &str,
+        idle: Duration,
+    ) -> Response<Body> {
         if request.method != Method::GET && request.method != Method::HEAD {
             let mut response = empty_response(StatusCode::METHOD_NOT_ALLOWED);
             response
@@ -79,19 +85,24 @@ impl DocumentRoot {
         let Ok(permit) = self.file_work.clone().acquire_owned().await else {
             return empty_response(StatusCode::SERVICE_UNAVAILABLE);
         };
-        let root = self.root.clone();
-        let index = self.index.clone();
+        let root = Arc::clone(self);
         let trailing_slash = request.uri.path().ends_with('/');
-        let selection = spawn_blocking(move || {
+        let mut prepare = spawn_blocking(move || {
             let _permit = permit;
-            select_file(&root, &path, index.as_deref(), trailing_slash)
-        })
-        .await;
-        match selection {
-            Ok(Ok(Selection::File(document))) => self.file_response(request, document),
-            Ok(Ok(Selection::Directory)) => redirect_directory(request),
-            Ok(Err(_)) => empty_response(StatusCode::NOT_FOUND),
-            Err(_) => empty_response(StatusCode::INTERNAL_SERVER_ERROR),
+            match select_file(&root.root, &path, root.index.as_deref(), trailing_slash) {
+                Ok(Selection::File(document)) => root.file_response(request, document),
+                Ok(Selection::Directory) => redirect_directory(request),
+                Err(_) => empty_response(StatusCode::NOT_FOUND),
+            }
+        });
+        // A small response's first body read now happens before its headers are sent.
+        match timeout(idle, &mut prepare).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(_)) => empty_response(StatusCode::INTERNAL_SERVER_ERROR),
+            Err(_) => {
+                prepare.abort();
+                empty_response(StatusCode::SERVICE_UNAVAILABLE)
+            }
         }
     }
 
@@ -133,19 +144,29 @@ impl DocumentRoot {
                 return response;
             }
         };
+        let size = range.end - range.start;
         response
             .headers_mut()
-            .insert(CONTENT_LENGTH, HeaderValue::from(range.end - range.start));
+            .insert(CONTENT_LENGTH, HeaderValue::from(size));
         response
             .headers_mut()
             .insert(CONTENT_TYPE, value(document.content_type.as_ref()));
-        if request.method == Method::GET && !range.is_empty() {
-            *response.body_mut() = file_body(
-                document.file,
-                range,
-                self.file_work.clone(),
-                self.max_buffer_bytes,
-            );
+        if request.method == Method::GET && size > 0 {
+            let max_buffered_bytes = self.max_buffer_bytes.min(MAX_BUFFERED_FILE_BYTES);
+            let body = if size <= max_buffered_bytes as u64 {
+                match read_file_chunk(&document.file, range.start, size as usize) {
+                    Ok(bytes) => body::full(bytes),
+                    Err(error) => body::boxed(StreamBody::new(stream::iter([Err(error)]))),
+                }
+            } else {
+                file_body(
+                    document.file,
+                    range,
+                    self.file_work.clone(),
+                    self.max_buffer_bytes,
+                )
+            };
+            *response.body_mut() = body;
         }
         response
     }
@@ -247,9 +268,7 @@ fn file_body(
             let permit = file_work.acquire_owned().await.map_err(io::Error::other)?;
             let bytes = spawn_blocking(move || {
                 let _permit = permit;
-                let mut buffer = vec![0; size];
-                file.read_exact_at(&mut buffer, offset)?;
-                Ok::<_, io::Error>(Bytes::from(buffer))
+                read_file_chunk(&file, offset, size)
             })
             .await
             .map_err(io::Error::other)??;
@@ -258,6 +277,12 @@ fn file_body(
         }
     });
     body::boxed(StreamBody::new(stream))
+}
+
+fn read_file_chunk(file: &File, offset: u64, size: usize) -> io::Result<Bytes> {
+    let mut buffer = vec![0; size];
+    file.read_exact_at(&mut buffer, offset)?;
+    Ok(Bytes::from(buffer))
 }
 
 fn redirect_directory(request: Parts) -> Response<Body> {
@@ -458,12 +483,14 @@ fn decimal(value: &str) -> Option<u64> {
 mod tests {
     use std::{fs, os::unix::fs::symlink};
 
+    use futures_util::FutureExt;
     use http::Request;
     use http_body_util::BodyExt;
     use rustix::fs::{CWD, Mode, mkfifoat};
-    use tokio::time::timeout;
 
     use super::*;
+
+    const IDLE: Duration = Duration::from_secs(10);
 
     fn request(method: Method, uri: &str, headers: &[(&str, &str)]) -> Parts {
         let mut request = Request::builder().method(method).uri(uri);
@@ -473,8 +500,11 @@ mod tests {
         request.body(()).unwrap().into_parts().0
     }
 
-    fn root(path: &Path) -> DocumentRoot {
-        DocumentRoot::open(path, Some("index.html"), Arc::new(Semaphore::new(2)), 8192).unwrap()
+    fn root(path: &Path) -> Arc<DocumentRoot> {
+        Arc::new(
+            DocumentRoot::open(path, Some("index.html"), Arc::new(Semaphore::new(2)), 8192)
+                .unwrap(),
+        )
     }
 
     #[tokio::test]
@@ -485,13 +515,17 @@ mod tests {
         let root = root(directory.path());
 
         let redirect = root
-            .serve(request(Method::GET, "/mounted/docs?x=1&x=2", &[]), "docs")
+            .serve(
+                request(Method::GET, "/mounted/docs?x=1&x=2", &[]),
+                "docs",
+                IDLE,
+            )
             .await;
         assert_eq!(redirect.status(), StatusCode::PERMANENT_REDIRECT);
         assert_eq!(redirect.headers()[LOCATION], "/mounted/docs/?x=1&x=2");
 
         let get = root
-            .serve(request(Method::GET, "/docs/", &[]), "docs/")
+            .serve(request(Method::GET, "/docs/", &[]), "docs/", IDLE)
             .await;
         assert_eq!(get.status(), StatusCode::OK);
         assert_eq!(get.headers()[CONTENT_TYPE], "text/html");
@@ -509,6 +543,7 @@ mod tests {
             .serve(
                 request(Method::GET, "/docs/", &[("range", "bytes=2-4")]),
                 "docs/",
+                IDLE,
             )
             .await;
         assert_eq!(range.status(), StatusCode::PARTIAL_CONTENT);
@@ -524,6 +559,7 @@ mod tests {
                     &[("range", "bytes=123456789012345678901-")],
                 ),
                 "docs/",
+                IDLE,
             )
             .await;
         assert_eq!(oversized_range.status(), StatusCode::RANGE_NOT_SATISFIABLE);
@@ -533,6 +569,7 @@ mod tests {
             .serve(
                 request(Method::HEAD, "/docs/", &[("range", "bytes=-2")]),
                 "docs/",
+                IDLE,
             )
             .await;
         assert_eq!(head.status(), StatusCode::OK);
@@ -555,7 +592,11 @@ mod tests {
         ];
         for (name, value) in &conditional_headers {
             let response = root
-                .serve(request(Method::GET, "/docs/", &[(name, value)]), "docs/")
+                .serve(
+                    request(Method::GET, "/docs/", &[(name, value)]),
+                    "docs/",
+                    IDLE,
+                )
                 .await;
             assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
             assert_eq!(response.headers()[ETAG], etag);
@@ -565,6 +606,7 @@ mod tests {
             .serve(
                 request(Method::GET, "/docs/", &[("if-match", &etag)]),
                 "docs/",
+                IDLE,
             )
             .await;
         assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
@@ -576,11 +618,12 @@ mod tests {
                     &[("range", "bytes=0-1"), ("if-range", &etag)],
                 ),
                 "docs/",
+                IDLE,
             )
             .await;
         assert_eq!(response.status(), StatusCode::OK);
         let response = root
-            .serve(request(Method::POST, "/docs/", &[]), "docs/")
+            .serve(request(Method::POST, "/docs/", &[]), "docs/", IDLE)
             .await;
         assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
         assert_eq!(response.headers()[ALLOW], "GET, HEAD");
@@ -608,14 +651,14 @@ mod tests {
         ] {
             let response = timeout(
                 Duration::from_secs(2),
-                root.serve(request(Method::GET, "/", &[]), path),
+                root.serve(request(Method::GET, "/", &[]), path, IDLE),
             )
             .await
             .unwrap();
             assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
         }
         let response = root
-            .serve(request(Method::GET, "/a%20b%252F", &[]), "a%20b%252F")
+            .serve(request(Method::GET, "/a%20b%252F", &[]), "a%20b%252F", IDLE)
             .await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
@@ -623,9 +666,72 @@ mod tests {
             "once"
         );
         let response = root
-            .serve(request(Method::GET, "/a%20b%252F/", &[]), "a%20b%252F/")
+            .serve(
+                request(Method::GET, "/a%20b%252F/", &[]),
+                "a%20b%252F/",
+                IDLE,
+            )
             .await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn serves_small_range_without_another_file_permit() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("file.txt"), "abcdef").unwrap();
+        let work = Arc::new(Semaphore::new(1));
+        let root = Arc::new(DocumentRoot::open(directory.path(), None, work.clone(), 3).unwrap());
+        let response = root
+            .serve(
+                request(Method::GET, "/file.txt", &[("range", "bytes=2-4")]),
+                "file.txt",
+                IDLE,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.headers()[CONTENT_LENGTH], "3");
+
+        let _permit = work.acquire().await.unwrap();
+        let mut body = response.into_body();
+        let frame = body.frame().now_or_never().expect("range is ready to send");
+        assert_eq!(frame.unwrap().unwrap().into_data().unwrap(), "cde");
+    }
+
+    #[test]
+    fn times_out_static_preparation() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("file.txt"), "body").unwrap();
+        let work = Arc::new(Semaphore::new(1));
+        let root = Arc::new(DocumentRoot::open(directory.path(), None, work, 8192).unwrap());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (release, hold) = std::sync::mpsc::channel::<()>();
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let job = spawn_blocking(move || {
+                started.send(()).unwrap();
+                let _ = hold.recv();
+            });
+            ready.await.unwrap();
+
+            let get = || request(Method::GET, "/file.txt", &[]);
+            let response = timeout(
+                IDLE,
+                root.serve(get(), "file.txt", Duration::from_millis(10)),
+            )
+            .await;
+            drop(release);
+            job.await.unwrap();
+            assert_eq!(response.unwrap().status(), StatusCode::SERVICE_UNAVAILABLE);
+
+            let response = timeout(IDLE, root.serve(get(), "file.txt", IDLE))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        });
     }
 
     #[tokio::test]
@@ -633,9 +739,9 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         fs::write(directory.path().join("file.txt"), "old body").unwrap();
         let work = Arc::new(Semaphore::new(1));
-        let root = DocumentRoot::open(directory.path(), None, work.clone(), 3).unwrap();
+        let root = Arc::new(DocumentRoot::open(directory.path(), None, work.clone(), 3).unwrap());
         let response = root
-            .serve(request(Method::GET, "/file.txt", &[]), "file.txt")
+            .serve(request(Method::GET, "/file.txt", &[]), "file.txt", IDLE)
             .await;
         fs::write(directory.path().join("next.txt"), "changed").unwrap();
         fs::rename(
@@ -658,7 +764,7 @@ mod tests {
         assert_eq!(remaining, " body");
 
         let next = root
-            .serve(request(Method::GET, "/file.txt", &[]), "file.txt")
+            .serve(request(Method::GET, "/file.txt", &[]), "file.txt", IDLE)
             .await;
         assert_eq!(
             next.into_body().collect().await.unwrap().to_bytes(),

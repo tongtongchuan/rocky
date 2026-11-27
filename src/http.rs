@@ -241,7 +241,7 @@ impl Runtime {
             RouteAction::Files(root) => {
                 let relative = path.strip_prefix(&route.prefix).unwrap_or_default();
                 let relative = relative.strip_prefix('/').unwrap_or(relative);
-                root.serve(request.into_parts().0, relative).await
+                root.serve(request.into_parts().0, relative, idle).await
             }
             RouteAction::Proxy(name, pool) => {
                 record.upstream = Some(name.clone());

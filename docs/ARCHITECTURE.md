@@ -45,6 +45,8 @@ The writer activates health and certificate jobs after publication and retires j
 
 Each listener and the process bound accepted connections. Each HTTP transport bounds single-connection stream and header work, and a process-wide permit follows each admitted HTTP exchange through its body. File work, endpoint concurrency, upstream idle pools, ACME orders, and client token buckets have separate budgets. Body limits and timeouts apply during streaming, so a blocked exchange does not need an unbounded queue.
 
+One blocking job selects the file and reads response bodies up to 64 KiB within `max_buffer_bytes`. Larger responses stream from the selected descriptor in bounded chunks. Once a file-work permit is acquired, `body_idle_timeout` also bounds static response preparation. Rocky sends HTTP `503` if that deadline expires before the response is ready.
+
 `rocky status` returns JSON over a private Unix socket with the generation, listener and certificate readiness, endpoint health, and aggregate counters and timings. Request logs use configured names for attribution and omit query strings, headers, and bodies.
 
 ## Implementation choices

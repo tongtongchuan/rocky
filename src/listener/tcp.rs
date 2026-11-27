@@ -98,6 +98,8 @@ async fn serve_http<S>(
     match connection.protocol {
         Protocol::H1 => {
             let http = http1::Builder::new()
+                // The buffered writer was faster for large streamed responses.
+                .writev(false)
                 .timer(TokioTimer::new())
                 .header_read_timeout(limits.request_head_timeout)
                 .max_buf_size(limits.max_header_bytes.max(8192))
@@ -191,6 +193,19 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for WriteIdle<S> {
         bytes: &[u8],
     ) -> Poll<io::Result<usize>> {
         let progress = Pin::new(&mut self.socket).poll_write(cx, bytes);
+        self.check(progress, cx)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.socket.is_write_vectored()
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffers: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let progress = Pin::new(&mut self.socket).poll_write_vectored(cx, buffers);
         self.check(progress, cx)
     }
 
